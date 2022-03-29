@@ -3,13 +3,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Diagnostics.CodeAnalysis;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Windows.Win32;
@@ -22,13 +24,13 @@ using static UsbIpServer.Tools;
 
 namespace UsbIpServer
 {
-    [SuppressMessage("Performance", "CA1812:Avoid uninstantiated internal classes", Justification = "Instantiated by DI")]
     sealed class AttachedClient
     {
-        public AttachedClient(ILogger<AttachedClient> logger, ClientContext clientContext)
+        public AttachedClient(ILogger<AttachedClient> logger, ClientContext clientContext, PcapNg pcap)
         {
             Logger = logger;
             ClientContext = clientContext;
+            Pcap = pcap;
 
             var tcpClient = clientContext.TcpClient;
             Stream = tcpClient.GetStream();
@@ -40,14 +42,45 @@ namespace UsbIpServer
 
         readonly ILogger Logger;
         readonly ClientContext ClientContext;
+        readonly PcapNg Pcap;
         readonly NetworkStream Stream;
+        readonly Channel<byte[]> ReplyChannel = Channel.CreateUnbounded<byte[]>();
         readonly DeviceFile Device;
-        readonly SemaphoreSlim WriteMutex = new(1);
-        readonly object PendingSubmitsLock = new();
+
         /// <summary>
         /// Mapping from USBIP seqnum to raw USB endpoint number.
+        /// Used for UNLINK.
         /// </summary>
-        readonly SortedDictionary<uint, byte> PendingSubmits = new();
+        readonly ConcurrentDictionary<uint, byte> PendingSubmits = new();
+
+        /// <summary>
+        /// Mapping from endpoint to its channel for ordered replies.
+        /// </summary>
+        readonly ConcurrentDictionary<byte, ChannelWriter<Task<byte[]>>> EndpointChannels = new();
+
+        /// <summary>
+        /// Returns the channel writer for the given raw endpoint number.
+        /// </summary>
+        ChannelWriter<Task<byte[]>> GetEndpointWriter(byte rawEndpoint, CancellationToken cancellationToken)
+        {
+            return EndpointChannels.GetOrAdd(rawEndpoint, (_) =>
+            {
+                var channel = Channel.CreateUnbounded<Task<byte[]>>();
+                Task.Run(async () =>
+                {
+                    // This task ensures that all replies for this specific endpoint are
+                    // returned in the same order as the requests.
+                    while (!cancellationToken.IsCancellationRequested)
+                    {
+                        var nextEndpointTask = await channel.Reader.ReadAsync(cancellationToken);
+                        var nextEndpointReply = await nextEndpointTask;
+                        // This multiplexes the replies for this endpoint with the other endpoints.
+                        await ReplyChannel.Writer.WriteAsync(nextEndpointReply);
+                    }
+                }, cancellationToken);
+                return channel.Writer;
+            });
+        }
 
         async Task HandleSubmitIsochronousAsync(UsbIpHeaderBasic basic, UsbIpHeaderCmdSubmit submit, CancellationToken cancellationToken)
         {
@@ -72,15 +105,13 @@ namespace UsbIpServer
 
             // Everything has been read and validated, now process...
 
-            lock (PendingSubmitsLock)
+            Pcap.DumpPacketIsoRequest(basic, submit, packetDescriptors, basic.direction == UsbIpDir.USBIP_DIR_OUT ? buf : ReadOnlySpan<byte>.Empty);
+
+            // To support UNLINK, we must be able to abort the pipe that is used for this URB.
+            // We need the raw USB endpoint number, i.e. including the high bit for input pipes.
+            if (!PendingSubmits.TryAdd(basic.seqnum, basic.RawEndpoint()))
             {
-                // To support UNLINK, we must be able to abort the pipe that is used for this URB.
-                // We need the raw USB endpoint number, i.e. including the high bit for input pipes.
-                if (!PendingSubmits.TryAdd(basic.seqnum, (byte)(basic.ep | (basic.direction == UsbIpDir.USBIP_DIR_IN ? 0x80u : 0x00u))))
-                {
-                    throw new ProtocolViolationException($"duplicate sequence number {basic.seqnum}");
-                }
-                Logger.Trace($"Scheduled seqnum={basic.seqnum}, pending count = {PendingSubmits.Count}");
+                throw new ProtocolViolationException($"duplicate sequence number {basic.seqnum}");
             }
 
             // VBoxUSB only excepts up to 8 iso packets per ioctl, so we may have to split
@@ -141,22 +172,10 @@ namespace UsbIpServer
                 }
 
                 // Continue when all ioctls *and* their continuations have been completed.
-                _ = Task.WhenAll(ioctls).ContinueWith(async (task, state) =>
+                var replyTask = Task.WhenAll(ioctls).ContinueWith(byte[] (task, _) =>
                 {
-                    using var writeLock = await Lock.CreateAsync(WriteMutex, cancellationToken);
-
-                    // Now we are synchronous with the sender.
-
-                    lock (PendingSubmitsLock)
-                    {
-                        // We are racing with possible UNLINK commands.
-                        if (!PendingSubmits.Remove(basic.seqnum))
-                        {
-                            // Apparently, the client has already UNLINK-ed (canceled) the request; we're done.
-                            Logger.Trace($"Completed seqnum={basic.seqnum} after UNLINK, pending count = {PendingSubmits.Count}");
-                            return;
-                        }
-                    }
+                    // The pending request is now completed; no need to support UNLINK any longer.
+                    PendingSubmits.TryRemove(basic.seqnum, out var _);
 
                     var header = new UsbIpHeader
                     {
@@ -175,8 +194,6 @@ namespace UsbIpServer
                         },
                     };
 
-                    Logger.Trace($"ISO: error_count: {header.ret_submit.error_count}, actual_length: {header.ret_submit.actual_length}");
-
                     var retBuf = buf;
                     if ((basic.direction == UsbIpDir.USBIP_DIR_IN) && (header.ret_submit.actual_length != submit.transfer_buffer_length))
                     {
@@ -192,13 +209,26 @@ namespace UsbIpServer
                         }
                     }
 
-                    await Stream.WriteAsync(header.ToBytes(), cancellationToken);
+                    Pcap.DumpPacketIsoReply(basic, submit, header.ret_submit, packetDescriptors, basic.direction == UsbIpDir.USBIP_DIR_IN ? retBuf.AsSpan(0, header.ret_submit.actual_length) : ReadOnlySpan<byte>.Empty);
+                    using var replyStream = new MemoryStream();
+                    replyStream.Write(header.ToBytes());
                     if (basic.direction == UsbIpDir.USBIP_DIR_IN)
                     {
-                        await Stream.WriteAsync(retBuf, cancellationToken);
+                        replyStream.Write(retBuf);
                     }
-                    await Stream.WriteAsync(packetDescriptors.ToBytes(), cancellationToken);
+                    replyStream.Write(packetDescriptors.ToBytes());
+                    return replyStream.ToArray();
                 }, cancellationToken, TaskScheduler.Default);
+
+                // Now we queue the task that creates the response, so that all replies for a single
+                // endpoint remain ordered.
+
+                var endpointWriter = GetEndpointWriter(basic.RawEndpoint(), cancellationToken);
+                await endpointWriter.WriteAsync(replyTask, cancellationToken);
+
+                // We return to the caller, so that the next request can be handled. As a result, multiple requests
+                // can be outstanding (either for the same, or for multiple endpoints). Requests are completed
+                // asynchronously and in any order, but the replies for each endpoint are sent to the client in original order.
             }
             finally
             {
@@ -211,9 +241,7 @@ namespace UsbIpServer
 
         async Task HandleSubmitAsync(UsbIpHeaderBasic basic, UsbIpHeaderCmdSubmit submit, CancellationToken cancellationToken)
         {
-            // We are synchronous with the receiver.
-
-            if (submit.number_of_packets != 0)
+            if (basic.EndpointType(submit) == UsbSupTransferType.USBSUP_TRANSFER_TYPE_ISOC)
             {
                 await HandleSubmitIsochronousAsync(basic, submit, cancellationToken);
                 return;
@@ -221,7 +249,7 @@ namespace UsbIpServer
 
             var urb = new UsbSupUrb()
             {
-                type = (basic.ep) == 0 ? UsbSupTransferType.USBSUP_TRANSFER_TYPE_MSG : UsbSupTransferType.USBSUP_TRANSFER_TYPE_BULK,
+                type = basic.EndpointType(submit),
                 ep = basic.ep,
                 dir = (basic.direction == UsbIpDir.USBIP_DIR_IN) ? UsbSupDirection.USBSUP_DIRECTION_IN : UsbSupDirection.USBSUP_DIRECTION_OUT,
                 flags = (basic.direction == UsbIpDir.USBIP_DIR_IN)
@@ -229,8 +257,8 @@ namespace UsbIpServer
                     : UsbSupXferFlags.USBSUP_FLAG_NONE,
                 error = UsbSupError.USBSUP_XFER_OK,
                 len = submit.transfer_buffer_length,
-                numIsoPkts = (uint)submit.number_of_packets,
-                aIsoPkts = new UsbSupIsoPkt[8],
+                numIsoPkts = 0, // number_of_packets == 0 here
+                aIsoPkts = new UsbSupIsoPkt[8], // unused, but must be present for VBoxUsb
             };
 
             var requestLength = submit.transfer_buffer_length;
@@ -259,7 +287,9 @@ namespace UsbIpServer
             //   This means no further requests will be read until the special request has completed.
             // - Otherwise, we will start a new task so that the receiver can continue.
             //   This means multiple URBs can be outstanding awaiting completion.
-            //   The pending URBs can be completed out of order, but the replies must be sent atomically.
+            //   The pending URBs can be completed out of order, but for each endpoint the replies must be sent in order.
+
+            Pcap.DumpPacketNonIsoRequest(basic, submit, basic.direction == UsbIpDir.USBIP_DIR_OUT ? buf.AsSpan(payloadOffset) : ReadOnlySpan<byte>.Empty);
 
             Task ioctl;
             var pending = false;
@@ -307,21 +337,14 @@ namespace UsbIpServer
             }
             else
             {
-                if (urb.type == UsbSupTransferType.USBSUP_TRANSFER_TYPE_MSG)
+                // To support UNLINK, we must be able to abort the pipe that is used for this URB.
+                // We need the raw USB endpoint number, i.e. including the high bit for input pipes.
+                if (!PendingSubmits.TryAdd(basic.seqnum, basic.RawEndpoint()))
                 {
-                    Logger.Trace($"{submit.setup.bmRequestType.B} {submit.setup.bRequest} {submit.setup.wValue.W} {submit.setup.wIndex.W} {submit.setup.wLength}");
-                }
-                lock (PendingSubmitsLock)
-                {
-                    // To support UNLINK, we must be able to abort the pipe that is used for this URB.
-                    // We need the raw USB endpoint number, i.e. including the high bit for input pipes.
-                    if (!PendingSubmits.TryAdd(basic.seqnum, (byte)(basic.ep | (basic.direction == UsbIpDir.USBIP_DIR_IN ? 0x80u : 0x00u))))
-                    {
-                        throw new ProtocolViolationException($"duplicate sequence number {basic.seqnum}");
-                    }
-                    Logger.Trace($"Scheduled seqnum={basic.seqnum}, pending count = {PendingSubmits.Count}");
+                    throw new ProtocolViolationException($"duplicate sequence number {basic.seqnum}");
                 }
                 pending = true;
+
                 // Input or output, exceptions or not, this buffer must be locked until after the ioctl has completed.
                 var gcHandle = GCHandle.Alloc(buf, GCHandleType.Pinned);
                 try
@@ -342,28 +365,36 @@ namespace UsbIpServer
             }
 
             // At this point we have initiated the ioctl (and possibly awaited it for special cases).
-            // Now we schedule a continuation to write the response once the ioctl completes.
-            // This is fire-and-forget; we'll return to the caller so it can already receive the next request.
+            // Now we schedule a continuation to create the response once the ioctl completes.
 
-            _ = ioctl.ContinueWith(async (task, state) =>
+            var replyTask = ioctl.ContinueWith(byte[] (task, _) =>
             {
-                using var writeLock = await Lock.CreateAsync(WriteMutex, cancellationToken);
-
-                // Now we are synchronous with the sender.
-
                 if (pending)
                 {
-                    lock (PendingSubmitsLock)
+                    // The pending request is now completed; no need to support UNLINK any longer.
+                    PendingSubmits.Remove(basic.seqnum, out var _);
+                    BytesToStruct(bytes, out urb);
+                }
+
+                if ((basic.ep == 0)
+                    && (submit.setup.bmRequestType.B == (PInvoke.BMREQUEST_TO_DEVICE | (PInvoke.BMREQUEST_DEVICE_TO_HOST << 7)))
+                    && (submit.setup.bRequest == PInvoke.USB_REQUEST_GET_DESCRIPTOR)
+                    && (submit.setup.wValue.Anonymous.HiByte == PInvoke.USB_CONFIGURATION_DESCRIPTOR_TYPE))
+                {
+                    try
                     {
-                        // We are racing with possible UNLINK commands.
-                        if (!PendingSubmits.Remove(basic.seqnum))
+                        var configuration = BytesToStruct<USB_CONFIGURATION_DESCRIPTOR>(buf.AsSpan(payloadOffset));
+                        if ((configuration.bDescriptorType == PInvoke.USB_CONFIGURATION_DESCRIPTOR_TYPE)
+                            && ((configuration.bmAttributes & PInvoke.USB_CONFIG_REMOTE_WAKEUP) == PInvoke.USB_CONFIG_REMOTE_WAKEUP))
                         {
-                            // Apparently, the client has already UNLINK-ed (canceled) the request; we're done.
-                            Logger.Trace($"Completed seqnum={basic.seqnum} after UNLINK, pending count = {PendingSubmits.Count}");
-                            return;
+                            Logger.Debug("Masked USB_CONFIG_REMOTE_WAKEUP");
+                            configuration.bmAttributes &= unchecked((byte)~PInvoke.USB_CONFIG_REMOTE_WAKEUP);
+                            StructToBytes(configuration, buf.AsSpan(payloadOffset));
                         }
                     }
-                    BytesToStruct(bytes, out urb);
+#pragma warning disable CA1031 // Do not catch general exception types
+                    catch { }
+#pragma warning restore CA1031 // Do not catch general exception types
                 }
 
                 var header = new UsbIpHeader
@@ -377,8 +408,8 @@ namespace UsbIpServer
                     {
                         status = -(int)ConvertError(urb.error),
                         actual_length = (int)urb.len,
-                        start_frame = submit.start_frame,
-                        number_of_packets = (int)urb.numIsoPkts,
+                        start_frame = 0, // shall be 0 for non-ISO
+                        number_of_packets = unchecked((int)0xffffffff), // shall be 0xffffffff for non-ISO
                         error_count = 0,
                     },
                 };
@@ -392,28 +423,34 @@ namespace UsbIpServer
                 {
                     Logger.Debug($"{urb.error} -> {ConvertError(urb.error)} -> {header.ret_submit.status}");
                 }
-                Logger.Trace($"actual: {header.ret_submit.actual_length}, requested: {requestLength}");
 
-                await Stream.WriteAsync(header.ToBytes(), cancellationToken);
+                Pcap.DumpPacketNonIsoReply(basic, submit, header.ret_submit, basic.direction == UsbIpDir.USBIP_DIR_IN ? buf.AsSpan(payloadOffset, header.ret_submit.actual_length) : ReadOnlySpan<byte>.Empty);
+                using var replyStream = new MemoryStream();
+                replyStream.Write(header.ToBytes());
                 if (basic.direction == UsbIpDir.USBIP_DIR_IN)
                 {
-                    await Stream.WriteAsync(buf.AsMemory(payloadOffset, header.ret_submit.actual_length), cancellationToken);
+                    replyStream.Write(buf.AsSpan(payloadOffset, header.ret_submit.actual_length));
                 }
+                return replyStream.ToArray();
             }, cancellationToken, TaskScheduler.Default);
+
+            // Now we queue the task that creates the response, so that all replies for a single
+            // endpoint remain ordered.
+
+            var endpointWriter = GetEndpointWriter(basic.RawEndpoint(), cancellationToken);
+            await endpointWriter.WriteAsync(replyTask, cancellationToken);
+
+            // We return to the caller, so that the next request can be handled. As a result, multiple requests
+            // can be outstanding (either for the same, or for multiple endpoints). Requests are completed
+            // asynchronously and in any order, but the replies for each endpoint are sent to the client in original order.
         }
 
         async Task HandleUnlinkAsync(UsbIpHeaderBasic basic, UsbIpHeaderCmdUnlink unlink, CancellationToken cancellationToken)
         {
             // We are synchronous with the receiver.
 
-            var pending = false;
-            byte endpoint;
-
-            lock (PendingSubmitsLock)
-            {
-                pending = PendingSubmits.Remove(unlink.seqnum, out endpoint);
-                Logger.Trace($"Unlinking {unlink.seqnum}, pending = {pending}, pending count = {PendingSubmits.Count}");
-            }
+            var pending = PendingSubmits.TryGetValue(unlink.seqnum, out var rawEndpoint);
+            Logger.Trace($"Unlinking {unlink.seqnum}, pending = {pending}, pending count = {PendingSubmits.Count}");
 
             if (pending)
             {
@@ -421,17 +458,13 @@ namespace UsbIpServer
                 // This is OK, since Linux will normally unlink all URBs anyway in quick succession.
                 var clearEndpoint = new UsbSupClearEndpoint()
                 {
-                    bEndpoint = endpoint,
+                    bEndpoint = rawEndpoint,
                 };
                 // Just like for CLEAR_FEATURE, we are going to wait until this finishes,
                 // in order to avoid races with subsequent SUBMIT to the same endpoint.
-                Logger.Trace($"Aborting endpoint {endpoint}");
+                Logger.Trace($"Aborting endpoint {rawEndpoint}");
                 await Device.IoControlAsync(SUPUSB_IOCTL.USB_ABORT_ENDPOINT, StructToBytes(clearEndpoint), null);
             }
-
-            using var writeLock = await Lock.CreateAsync(WriteMutex, cancellationToken);
-
-            // Now we are synchronous with the sender.
 
             var header = new UsbIpHeader
             {
@@ -442,27 +475,45 @@ namespace UsbIpServer
                 },
                 ret_submit = new()
                 {
-                    status = -(int)(pending ? Errno.ECONNRESET : Errno.SUCCESS),
+                    status = -(int)Errno.SUCCESS,
                 },
             };
 
-            await Stream.WriteAsync(header.ToBytes(), cancellationToken);
+            if (pending)
+            {
+                // We need to queue this on the same endpoint that the UNLINK was for, such
+                // that the reply of the aborted request gets sent first.
+                var endpointWriter = GetEndpointWriter(rawEndpoint, cancellationToken);
+                await endpointWriter.WriteAsync(Task.FromResult(header.ToBytes()), cancellationToken);
+            }
+            else
+            {
+                // We didn't actually need to abort anything, so we can write the reply immediately.
+                await ReplyChannel.Writer.WriteAsync(header.ToBytes(), cancellationToken);
+            }
         }
 
         public async Task RunAsync(CancellationToken cancellationToken)
         {
+            _ = Task.Run(async () =>
+            {
+                // This task multiplexes all the replies.
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    var nextReply = await ReplyChannel.Reader.ReadAsync(cancellationToken);
+                    await Stream.WriteAsync(nextReply, cancellationToken);
+                }
+            }, cancellationToken);
+
             while (true)
             {
                 var header = await Stream.ReadUsbIpHeaderAsync(cancellationToken);
                 switch (header.basic.command)
                 {
                     case UsbIpCmd.USBIP_CMD_SUBMIT:
-                        Logger.Trace($"USBIP_CMD_SUBMIT, seqnum={header.basic.seqnum}, flags={header.cmd_submit.transfer_flags}, " +
-                                $"length={header.cmd_submit.transfer_buffer_length}, ep={header.basic.ep}");
                         await HandleSubmitAsync(header.basic, header.cmd_submit, cancellationToken);
                         break;
                     case UsbIpCmd.USBIP_CMD_UNLINK:
-                        Logger.Trace($"USBIP_CMD_UNLINK, seqnum={header.basic.seqnum}, unlink_seqnum={header.cmd_unlink.seqnum}");
                         await HandleUnlinkAsync(header.basic, header.cmd_unlink, cancellationToken);
                         break;
                     default:

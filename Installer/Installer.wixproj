@@ -23,22 +23,24 @@ SPDX-License-Identifier: GPL-2.0-only
     <OutputName>usbipd-win</OutputName>
     <DefineSolutionProperties>false</DefineSolutionProperties>
     <PublishDir>..\UsbIpServer\bin\publish</PublishDir>
+    <PowerShellDir>..\Usbipd.PowerShell\bin\$(Configuration)\netstandard2.0\win</PowerShellDir>
     <NuGetPackageImportStamp>
     </NuGetPackageImportStamp>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|x64' ">
     <OutputPath>bin\$(Configuration)\</OutputPath>
-    <DefineConstants>Debug;PublishDir=$(PublishDir);DriversDir=$(ProjectDir)..\Drivers;Year=$([System.DateTime]::UtcNow.ToString("yyyy"))</DefineConstants>
+    <DefineConstants>Debug;PublishDir=$(PublishDir);PowerShellDir=$(PowerShellDir);DriversDir=$(ProjectDir)..\Drivers;Year=$([System.DateTime]::UtcNow.ToString("yyyy"))</DefineConstants>
     <Cultures>en-US</Cultures>
     <SuppressAllWarnings>False</SuppressAllWarnings>
     <Pedantic>True</Pedantic>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|x64' ">
     <OutputPath>bin\$(Configuration)\</OutputPath>
-    <DefineConstants>PublishDir=$(PublishDir);DriversDir=$(ProjectDir)..\Drivers;Year=$([System.DateTime]::UtcNow.ToString("yyyy"))</DefineConstants>
+    <DefineConstants>PublishDir=$(PublishDir);PowerShellDir=$(PowerShellDir);DriversDir=$(ProjectDir)..\Drivers;Year=$([System.DateTime]::UtcNow.ToString("yyyy"))</DefineConstants>
     <Cultures>en-US</Cultures>
     <SuppressAllWarnings>False</SuppressAllWarnings>
     <Pedantic>True</Pedantic>
+    <TreatWarningsAsErrors>True</TreatWarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Drivers.wxs" />
@@ -54,6 +56,14 @@ SPDX-License-Identifier: GPL-2.0-only
       <ComponentGroupName>UsbIpServer</ComponentGroupName>
       <PreprocessorVariable>var.PublishDir</PreprocessorVariable>
       <Transforms>HarvestTransform.xslt</Transforms>
+    </HarvestDirectory>
+    <HarvestDirectory Include="$(PowerShellDir)" Visible="false">
+      <DirectoryRefId>PowerShell</DirectoryRefId>
+      <SuppressRootDirectory>true</SuppressRootDirectory>
+      <SuppressCOM>true</SuppressCOM>
+      <SuppressRegistry>true</SuppressRegistry>
+      <ComponentGroupName>PowerShell</ComponentGroupName>
+      <PreprocessorVariable>var.PowerShellDir</PreprocessorVariable>
     </HarvestDirectory>
   </ItemGroup>
   <ItemGroup>
@@ -72,6 +82,10 @@ SPDX-License-Identifier: GPL-2.0-only
     <WixExtension Include="WixUIExtension">
       <HintPath>$(WixExtDir)WixUIExtension.dll</HintPath>
       <Name>WixUIExtension</Name>
+    </WixExtension>
+    <WixExtension Include="WixUtilExtension">
+      <HintPath>$(WixExtDir)\WixUtilExtension.dll</HintPath>
+      <Name>WixUtilExtension</Name>
     </WixExtension>
   </ItemGroup>
   <Import Project="$(WixTargetsPath)" Condition=" '$(WixTargetsPath)' != '' " />
@@ -101,17 +115,16 @@ SPDX-License-Identifier: GPL-2.0-only
     This ensures that each x.y.z version has a different ProductId, so every update is a MajorUpgrade.
     It also ensures that 2 builds of the same x.y.z version will never be installed simultaneously.
     The alternative (WiX AllowSameVersionUpgrades) causes ICE61.
-    
-    The chance of a hash-collision is much smaller than the chance of forgetting to update ProductId manually.
     -->
-    <CreateProperty Value="$(DefineConstants);ProductId=EA1D5623-E6A7-4E4A-9259-E397$(GitVersion_MajorMinorPatch.GetHashCode().ToString(X8))">
+    <CreateProperty Value="$(DefineConstants);ProductId=EA1D5623-E6A7-4E4A-9259-E39722$([System.Byte]::Parse($(GitVersion_Major)).ToString(X2))$([System.Byte]::Parse($(GitVersion_Minor)).ToString(X2))$([System.Byte]::Parse($(GitVersion_Patch)).ToString(X2))">
       <Output TaskParameter="Value" PropertyName="DefineConstants" />
     </CreateProperty>
   </Target>
   <PropertyGroup>
     <PreBuildEvent>del /s /q "$(ProjectDir)..\UsbIpServer\bin\publish" &gt; NUL:
 rmdir /s /q "$(ProjectDir)..\UsbIpServer\bin\publish" &gt; NUL:
-dotnet publish --nologo --no-restore --no-build --configuration $(Configuration) $(ProjectDir)..\UsbIpServer</PreBuildEvent>
+dotnet publish --nologo --no-restore --no-build --configuration $(Configuration) $(ProjectDir)..\UsbIpServer
+del /s "$(ProjectDir)..\UsbIpServer\bin\publish\System.CommandLine.resources.dll"</PreBuildEvent>
   </PropertyGroup>
   <Import Project="..\InstallerDependencies\obj\InstallerDependencies.csproj.nuget.g.targets" Condition="Exists('..\InstallerDependencies\obj\InstallerDependencies.csproj.nuget.g.targets')" />
 </Project>

@@ -4,14 +4,12 @@
 
 using System;
 using System.ComponentModel;
-using System.Diagnostics;
-using System.IO;
-using System.Net;
+using System.Linq;
 using System.Runtime.InteropServices;
+using System.ServiceProcess;
 using System.Threading.Tasks;
-using Windows.Win32;
 
-using static UsbIpServer.Interop.VBoxUsb;
+using static UsbIpServer.Interop.VBoxUsbMon;
 using static UsbIpServer.Tools;
 
 namespace UsbIpServer
@@ -20,15 +18,33 @@ namespace UsbIpServer
     {
         readonly DeviceFile UsbMonitor = new(USBMON_DEVICE_NAME);
 
-        public async Task CheckVersion()
+        public static UsbSupVersion? GetRunningVersion()
+        {
+            try
+            {
+                using var mon = new VBoxUsbMon();
+                return mon.GetVersion().Result;
+            }
+            catch (Win32Exception)
+            {
+                return null;
+            }
+        }
+
+        public static bool IsServiceInstalled()
+        {
+            return ServiceController.GetDevices().Any((sc) => sc.ServiceName.Equals(ServiceName, StringComparison.InvariantCultureIgnoreCase));
+        }
+
+        public static bool IsVersionSupported(UsbSupVersion version) =>
+            (version.major == USBMON_MAJOR_VERSION) && (version.minor >= USBMON_MINOR_VERSION);
+
+        public async Task<UsbSupVersion> GetVersion()
         {
             var output = new byte[Marshal.SizeOf<UsbSupVersion>()];
             await UsbMonitor.IoControlAsync(SUPUSBFLT_IOCTL.GET_VERSION, null, output);
             BytesToStruct(output, out UsbSupVersion version);
-            if ((version.major != USBMON_MAJOR_VERSION) || (version.minor < USBMON_MINOR_VERSION))
-            {
-                throw new NotSupportedException($"version not supported: {version.major}.{version.minor}, expected {USBMON_MAJOR_VERSION}.{USBMON_MINOR_VERSION}");
-            }
+            return version;
         }
 
         public async Task<ulong> AddFilter(ExportedDevice device)
@@ -60,104 +76,6 @@ namespace UsbIpServer
             if (rc != 0 /* VINF_SUCCESS */)
             {
                 throw new UnexpectedResultException($"SUPUSBFLT_IOCTL_REMOVE_FILTER failed with returnCode {rc}");
-            }
-        }
-
-        async Task<(ConfigurationManager.VBoxDevice, DeviceFile)> ClaimDeviceOnce(ExportedDevice device)
-        {
-            var vboxDevice = ConfigurationManager.GetVBoxDevice(device.BusId);
-            var dev = new DeviceFile(vboxDevice.InterfacePath);
-            try
-            {
-                {
-                    var output = new byte[Marshal.SizeOf<UsbSupVersion>()];
-                    await dev.IoControlAsync(SUPUSB_IOCTL.GET_VERSION, null, output);
-                    BytesToStruct(output, out UsbSupVersion version);
-                    if ((version.major != USBDRV_MAJOR_VERSION) || (version.minor < USBDRV_MINOR_VERSION))
-                    {
-                        throw new NotSupportedException($"device version not supported: {version.major}.{version.minor}, expected {USBDRV_MAJOR_VERSION}.{USBDRV_MINOR_VERSION}");
-                    }
-                }
-                {
-                    await dev.IoControlAsync(SUPUSB_IOCTL.IS_OPERATIONAL, null, null);
-                }
-                IntPtr hdev;
-                {
-                    var getDev = new UsbSupGetDev();
-                    var output = new byte[Marshal.SizeOf<UsbSupGetDev>()];
-                    await dev.IoControlAsync(SUPUSB_IOCTL.GET_DEVICE, StructToBytes(getDev), output);
-                    BytesToStruct(output, out getDev);
-                    hdev = getDev.hDevice;
-                }
-                {
-                    var getDev = new UsbSupGetDev()
-                    {
-                        hDevice = hdev,
-                    };
-                    var output = new byte[Marshal.SizeOf<UsbSupGetDevMon>()];
-                    await UsbMonitor.IoControlAsync(SUPUSBFLT_IOCTL.GET_DEVICE, StructToBytes(getDev), output);
-                    var getDevMon = BytesToStruct<UsbSupGetDevMon>(output);
-                }
-                {
-                    var claimDev = new UsbSupClaimDev();
-                    var output = new byte[Marshal.SizeOf<UsbSupClaimDev>()];
-                    await dev.IoControlAsync(SUPUSB_IOCTL.USB_CLAIM_DEVICE, StructToBytes(claimDev), output);
-                    BytesToStruct(output, out claimDev);
-                    if (!claimDev.fClaimed)
-                    {
-                        throw new ProtocolViolationException("could not claim");
-                    }
-                }
-                {
-                    var getDev = new UsbSupGetDev()
-                    {
-                        hDevice = hdev,
-                    };
-                    var output = new byte[Marshal.SizeOf<UsbSupGetDevMon>()];
-                    await UsbMonitor.IoControlAsync(SUPUSBFLT_IOCTL.GET_DEVICE, StructToBytes(getDev), output);
-                    var getDevMon = BytesToStruct<UsbSupGetDevMon>(output);
-                }
-
-                try
-                {
-                    // We act as a "class installer" for USBIP devices. Override the FriendlyName so
-                    // Windows device manager shows a nice descriptive name instead of the confusing
-                    // "VBoxUSB".
-
-                    // Best effort, not really a problem if this fails.
-                    ConfigurationManager.SetDeviceProperty(vboxDevice, PInvoke.DEVPKEY_Device_FriendlyName, $"USBIP Shared Device {device.BusId}");
-                }
-                catch (Win32Exception) { }
-
-                var result = dev;
-                dev = null!;
-                return (vboxDevice, result);
-            }
-            finally
-            {
-                dev?.Dispose();
-            }
-            throw new FileNotFoundException();
-        }
-
-        public async Task<(ConfigurationManager.VBoxDevice, DeviceFile)> ClaimDevice(ExportedDevice device)
-        {
-            var sw = new Stopwatch();
-            sw.Start();
-            while (true)
-            {
-                try
-                {
-                    return await ClaimDeviceOnce(device);
-                }
-                catch (FileNotFoundException)
-                {
-                    if (sw.Elapsed > TimeSpan.FromSeconds(5))
-                    {
-                        throw;
-                    }
-                    await Task.Delay(100);
-                }
             }
         }
 

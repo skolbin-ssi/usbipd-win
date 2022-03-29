@@ -29,6 +29,10 @@ namespace UsbIpServer.Interop
             /// <summary>WinSDK: usbioctl.h</summary>
             IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2 = (PInvoke.FILE_DEVICE_USB << 16) | (PInvoke.FILE_ANY_ACCESS << 14)
                 | (PInvoke.USB_GET_NODE_CONNECTION_INFORMATION_EX_V2 << 2) | (PInvoke.METHOD_BUFFERED),
+
+            /// <summary>WinSDK: usbioctl.h</summary>
+            IOCTL_USB_HUB_CYCLE_PORT = (PInvoke.FILE_DEVICE_USB << 16) | (PInvoke.FILE_ANY_ACCESS << 14)
+                | (PInvoke.USB_HUB_CYCLE_PORT << 2) | (PInvoke.METHOD_BUFFERED),
         }
 
         /// <summary>WinSDK: usbioctl.h: USB_DESCRIPTOR_REQUEST</summary>
@@ -94,5 +98,16 @@ namespace UsbIpServer.Interop
             public UsbProtocols SupportedUsbProtocols;
             public UsbNodeConnectionInformationExV2Flags Flags;
         }
+
+        /// <summary>WinSDK: usbioctl.h: USB_CYCLE_PORT_PARAMS</summary>
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        public struct UsbCyclePortParams
+        {
+            public uint ConnectionIndex;
+            public uint StatusReturned;
+        }
+
+        /// <summary>WinSDK: setupapi.h: ERROR_NO_DRIVER_SELECTED</summary>
+        public const uint ERROR_NO_DRIVER_SELECTED = PInvoke.APPLICATION_ERROR_MASK | PInvoke.ERROR_SEVERITY_ERROR | 0x203;
     }
 }

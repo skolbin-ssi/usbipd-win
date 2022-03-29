@@ -4,6 +4,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -13,6 +14,7 @@ using Windows.Win32;
 using Windows.Win32.Devices.DeviceAndDriverInstallation;
 using Windows.Win32.Devices.Properties;
 using Windows.Win32.UI.Shell.PropertiesSystem;
+using static UsbIpServer.Interop.WinSDK;
 
 namespace Windows.Win32.Devices.Properties
 {
@@ -43,30 +45,35 @@ namespace UsbIpServer
             }
         }
 
-        static uint Locate_DevNode(string instanceId)
+        public static uint Locate_DevNode(string instanceId, bool present)
         {
             unsafe
             {
                 fixed (char* pInstanceId = instanceId)
                 {
                     uint deviceNode;
-                    PInvoke.CM_Locate_DevNode(&deviceNode, (ushort*)pInstanceId, PInvoke.CM_LOCATE_DEVNODE_NORMAL).ThrowOnError(nameof(PInvoke.CM_Locate_DevNode));
+                    PInvoke.CM_Locate_DevNode(&deviceNode, (ushort*)pInstanceId, present ? PInvoke.CM_LOCATE_DEVNODE_NORMAL : PInvoke.CM_LOCATE_DEVNODE_PHANTOM).ThrowOnError(nameof(PInvoke.CM_Locate_DevNode));
                     return deviceNode;
                 }
             }
         }
 
-        static string[] Get_Device_Interface_List(in Guid interfaceClassGuid, uint flags)
+        static string[] Get_Device_Interface_List(in Guid interfaceClassGuid, string? deviceId, uint flags)
         {
             unsafe
             {
-                PInvoke.CM_Get_Device_Interface_List_Size(out var bufferLen, interfaceClassGuid, null, flags).ThrowOnError(nameof(PInvoke.CM_Get_Device_Interface_List_Size));
-                var deviceInterfaceList = new string('\0', (int)bufferLen);
-                fixed (char* buffer = deviceInterfaceList)
+                fixed (char* pDeviceId = deviceId)
                 {
-                    PInvoke.CM_Get_Device_Interface_List(interfaceClassGuid, null, buffer, bufferLen, flags).ThrowOnError(nameof(PInvoke.CM_Get_Device_Interface_List_Size));
+                    uint bufferLen;
+                    var guid = interfaceClassGuid;
+                    PInvoke.CM_Get_Device_Interface_List_Size(&bufferLen, &guid, (ushort*)pDeviceId, flags).ThrowOnError(nameof(PInvoke.CM_Get_Device_Interface_List_Size));
+                    var deviceInterfaceList = new string('\0', (int)bufferLen);
+                    fixed (char* buffer = deviceInterfaceList)
+                    {
+                        PInvoke.CM_Get_Device_Interface_List(&guid, (ushort*)pDeviceId, buffer, bufferLen, flags).ThrowOnError(nameof(PInvoke.CM_Get_Device_Interface_List_Size));
+                    }
+                    return deviceInterfaceList.Split('\0', StringSplitOptions.RemoveEmptyEntries);
                 }
-                return deviceInterfaceList.Split('\0', StringSplitOptions.RemoveEmptyEntries);
             }
         }
 
@@ -143,7 +150,7 @@ namespace UsbIpServer
         static Dictionary<uint, string> GetHubs()
         {
             var hubs = new Dictionary<uint, string>();
-            var hubInterfaces = Get_Device_Interface_List(PInvoke.GUID_DEVINTERFACE_USB_HUB, PInvoke.CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+            var hubInterfaces = Get_Device_Interface_List(PInvoke.GUID_DEVINTERFACE_USB_HUB, null, PInvoke.CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
             foreach (var hubInterface in hubInterfaces)
             {
                 try
@@ -151,7 +158,7 @@ namespace UsbIpServer
                     // This may fail due to a race condition between a hub being removed and querying its details.
                     // In such cases, just skip the hub as if it was never there in the first place.
                     var hubId = (string)Get_Device_Interface_Property(hubInterface, PInvoke.DEVPKEY_Device_InstanceId);
-                    var hubNode = Locate_DevNode(hubId);
+                    var hubNode = Locate_DevNode(hubId, true);
                     hubs.Add(hubNode, hubInterface);
                 }
                 catch (ConfigurationManagerException) { }
@@ -159,7 +166,7 @@ namespace UsbIpServer
             return hubs;
         }
 
-        static BusId GetBusId(uint deviceNode)
+        public static BusId GetBusId(uint deviceNode)
         {
             var locationInfo = (string)Get_DevNode_Property(deviceNode, PInvoke.DEVPKEY_Device_LocationInfo);
             var match = Regex.Match(locationInfo, "^Port_#([0-9]{4}).Hub_#([0-9]{4})$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
@@ -175,7 +182,19 @@ namespace UsbIpServer
             };
         }
 
-        static string GetDescription(uint deviceNode)
+        public static BusId? GetBusId(string instanceId)
+        {
+            try
+            {
+                return GetBusId(Locate_DevNode(instanceId, true));
+            }
+            catch (ConfigurationManagerException)
+            {
+                return null;
+            }
+        }
+
+        public static string GetDescription(uint deviceNode)
         {
             var isCompositeDevice = Get_DevNode_Property(deviceNode, PInvoke.DEVPKEY_Device_CompatibleIds) is string[] compatibleIds && compatibleIds.Contains(@"USB\COMPOSITE");
             if (!isCompositeDevice)
@@ -222,21 +241,12 @@ namespace UsbIpServer
             return string.Join(", ", descriptionList);
         }
 
-        public sealed record UsbDevice
-            : IComparable<UsbDevice>
-        {
-            public BusId BusId { get; init; }
-            public string DeviceId { get; init; } = string.Empty;
-            public string HubInterface { get; init; } = string.Empty;
-            public string Description { get; init; } = string.Empty;
+        public sealed record ConnectedUsbDevice(uint DeviceNode, string InstanceId);
 
-            public int CompareTo(UsbDevice? other) => (other is null) ? 1 : BusId.CompareTo(other.BusId);
-        }
-
-        public static SortedSet<UsbDevice> GetUsbDevices(bool includeDescriptions)
+        public static IEnumerable<ConnectedUsbDevice> GetConnectedUsbDevices()
         {
             var hubs = GetHubs();
-            var usbDevices = new SortedSet<UsbDevice>();
+            var usbDevices = new Dictionary<string, ConnectedUsbDevice>();
             foreach (var hub in hubs)
             {
                 foreach (var deviceNode in EnumChildren(hub.Key))
@@ -245,34 +255,43 @@ namespace UsbIpServer
                     // In such cases, just skip the device as if it was never there in the first place.
                     try
                     {
-                        if (!hubs.ContainsKey(deviceNode))
+                        if (hubs.ContainsKey(deviceNode))
                         {
-                            // Device is not a hub.
-                            usbDevices.Add(new()
-                            {
-                                BusId = GetBusId(deviceNode),
-                                DeviceId = (string)Get_DevNode_Property(deviceNode, PInvoke.DEVPKEY_Device_InstanceId),
-                                HubInterface = hub.Value,
-                                Description = includeDescriptions ? GetDescription(deviceNode) : string.Empty,
-                            });
+                            // Do not include hubs.
+                            continue;
                         }
+                        var hardwareIds = (string[])Get_DevNode_Property(deviceNode, PInvoke.DEVPKEY_Device_HardwareIds);
+                        if (hardwareIds.Any(hardwareId => hardwareId.Contains(Interop.VBoxUsb.StubHardwareId, StringComparison.InvariantCultureIgnoreCase)))
+                        {
+                            // Do not include stubs.
+                            continue;
+                        }
+                        var instanceId = (string)Get_DevNode_Property(deviceNode, PInvoke.DEVPKEY_Device_InstanceId);
+                        usbDevices[instanceId] = new(deviceNode, instanceId);
                     }
                     catch (ConfigurationManagerException) { }
                 }
             }
-            return usbDevices;
+            return usbDevices.Values;
         }
 
-        public sealed record VBoxDevice
+        public static string GetHubInterfacePath(string instanceId)
         {
-            public uint DeviceNode { get; init; }
-            public string InterfacePath { get; init; } = string.Empty;
+            return GetHubInterfacePath(Locate_DevNode(instanceId, true));
         }
 
+        static string GetHubInterfacePath(uint deviceNode)
+        {
+            PInvoke.CM_Get_Parent(out var hubDeviceNode, deviceNode, 0).ThrowOnError(nameof(PInvoke.CM_Get_Parent));
+            var hubInstanceId = (string)Get_DevNode_Property(hubDeviceNode, PInvoke.DEVPKEY_Device_InstanceId);
+            return Get_Device_Interface_List(PInvoke.GUID_DEVINTERFACE_USB_HUB, hubInstanceId, PInvoke.CM_GET_DEVICE_INTERFACE_LIST_PRESENT).Single();
+        }
+
+        public sealed record VBoxDevice(uint DeviceNode, string InstanceId, string InterfacePath);
 
         public static VBoxDevice GetVBoxDevice(BusId busId)
         {
-            var deviceInterfaces = Get_Device_Interface_List(Interop.VBoxUsb.GUID_CLASS_VBOXUSB, PInvoke.CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+            var deviceInterfaces = Get_Device_Interface_List(Interop.VBoxUsb.GUID_CLASS_VBOXUSB, null, PInvoke.CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
             foreach (var deviceInterface in deviceInterfaces)
             {
                 // This may fail due to a race condition between a device being removed and querying its details.
@@ -280,14 +299,10 @@ namespace UsbIpServer
                 try
                 {
                     var deviceId = (string)Get_Device_Interface_Property(deviceInterface, PInvoke.DEVPKEY_Device_InstanceId);
-                    var deviceNode = Locate_DevNode(deviceId);
+                    var deviceNode = Locate_DevNode(deviceId, true);
                     if (GetBusId(deviceNode) == busId)
                     {
-                        return new()
-                        {
-                            DeviceNode = deviceNode,
-                            InterfacePath = deviceInterface,
-                        };
+                        return new(deviceNode, deviceId, deviceInterface);
                     }
                 }
                 catch (ConfigurationManagerException) { }
@@ -295,48 +310,127 @@ namespace UsbIpServer
             throw new FileNotFoundException();
         }
 
-        public static void SetDeviceProperty(VBoxDevice vboxDevice, in DEVPROPKEY devPropKey, string value)
+        public static bool HasVBoxDriver(string instanceId)
+        {
+            try
+            {
+                var deviceNode = Locate_DevNode(instanceId, false);
+                var driverDesc = (string)Get_DevNode_Property(deviceNode, PInvoke.DEVPKEY_Device_DriverDesc);
+                return driverDesc == "VirtualBox USB";
+            }
+            catch (ConfigurationManagerException)
+            {
+                // Device is gone (uninstalled) or does not have a driver description.
+                // In any case, the device does not have the VBoxDriver.
+                return false;
+            }
+        }
+
+        public static IEnumerable<string> GetOriginalDeviceIdsWithVBoxDriver()
+        {
+            // This gets all the VBox driver installations ever installed, even those
+            // that are not currently installed for a device and for devices that are not
+            // plugged in now.
+            var deviceInterfaces = Get_Device_Interface_List(Interop.VBoxUsb.GUID_CLASS_VBOXUSB, null, PInvoke.CM_GET_DEVICE_INTERFACE_LIST_ALL_DEVICES);
+            foreach (var deviceInterface in deviceInterfaces)
+            {
+                string deviceId;
+                // This may fail due to one of the properties not existing.
+                // In such cases, just skip the device as it does not have the VBox driver currently anyway.
+                try
+                {
+                    deviceId = (string)Get_Device_Interface_Property(deviceInterface, PInvoke.DEVPKEY_Device_InstanceId);
+                    var deviceNode = Locate_DevNode(deviceId, false);
+                    // Filter out the devices that are mocked by VboxUsbMon, since those are supposed to have the VBox driver.
+                    var hardwareIds = (string[])Get_DevNode_Property(deviceNode, PInvoke.DEVPKEY_Device_HardwareIds);
+                    if (hardwareIds.Any(hardwareId => hardwareId.Contains(Interop.VBoxUsb.StubHardwareId, StringComparison.InvariantCultureIgnoreCase)))
+                    {
+                        continue;
+                    }
+                    // Don't return the device if the *current* driver isn't the VBox driver.
+                    if (!HasVBoxDriver(deviceId))
+                    {
+                        continue;
+                    }
+                }
+                catch (ConfigurationManagerException)
+                {
+                    continue;
+                }
+                yield return deviceId;
+            }
+        }
+
+        public static void SetDeviceFriendlyName(uint deviceNode)
         {
             unsafe
             {
-                fixed (DEVPROPKEY* pDevPropKey = &devPropKey)
+                var friendlyName = "USBIP Shared Device";
+                fixed (char* pValue = friendlyName)
                 {
-                    fixed (char* pValue = value)
-                    {
-                        PInvoke.CM_Set_DevNode_Property(vboxDevice.DeviceNode, pDevPropKey, PInvoke.DEVPROP_TYPE_STRING, (byte*)pValue, (uint)(value.Length + 1) * sizeof(char), 0);
-                    }
+                    DEVPROPKEY devPropKey = PInvoke.DEVPKEY_Device_FriendlyName;
+                    PInvoke.CM_Set_DevNode_Property(deviceNode, &devPropKey, PInvoke.DEVPROP_TYPE_STRING, (byte*)pValue, (uint)(friendlyName.Length + 1) * sizeof(char), 0).ThrowOnError(nameof(PInvoke.CM_Set_DevNode_Property));
                 }
             }
         }
 
-        public sealed class TemporarilyDisabledDevice
+        /// <summary>
+        /// See https://docs.microsoft.com/en-us/windows-hardware/drivers/install/porting-from-setupapi-to-cfgmgr32#restart-device
+        /// </summary>
+        public sealed class RestartingDevice
             : IDisposable
         {
-           public TemporarilyDisabledDevice(string instanceId)
-                : this(Locate_DevNode(instanceId))
+            public RestartingDevice(string instanceId)
+                 : this(Locate_DevNode(instanceId, true))
             {
             }
 
-            public TemporarilyDisabledDevice(uint deviceNode)
+            public RestartingDevice(uint deviceNode)
             {
                 DeviceNode = deviceNode;
-                PInvoke.CM_Disable_DevNode(DeviceNode, PInvoke.CM_DISABLE_UI_NOT_OK).ThrowOnError(nameof(PInvoke.CM_Disable_DevNode));
+                unsafe
+                {
+                    PNP_VETO_TYPE vetoType;
+                    var vetoName = new string('\0', (int)PInvoke.MAX_PATH);
+                    fixed (char* pVetoName = vetoName)
+                    {
+                        var cr = PInvoke.CM_Query_And_Remove_SubTree(DeviceNode, &vetoType, pVetoName, PInvoke.MAX_PATH, PInvoke.CM_REMOVE_NO_RESTART | PInvoke.CM_REMOVE_UI_NOT_OK);
+                        if (cr == CONFIGRET.CR_REMOVE_VETOED)
+                        {
+                            vetoName = vetoName.TrimEnd('\0');
+                            throw new ConfigurationManagerException(cr, $"{nameof(PInvoke.CM_Query_And_Remove_SubTree)} returned {cr}: {vetoType}, {vetoName}");
+                        }
+                        ThrowOnError(cr, nameof(PInvoke.CM_Query_And_Remove_SubTree));
+                    }
+                }
             }
 
             readonly uint DeviceNode;
 
             public void Dispose()
             {
+                // We ignore errors for multiple reasons:
+                // a) Dispose is not supposed to throw.
+                // b) Race condition with physical device removal.
+                // c) Race condition with the device node being marked ready by something else and
+                //    device enumeration already replaced the DevNode with its (non-)VBox counterpart.
+
                 try
                 {
-                    // We ignore errors for multiple reasons:
-                    // a) Dispose is not supposed to throw.
-                    // b) Race condition with physical device removal.
-                    // c) Race condition with the device node being enabled by something else and
-                    //    device enumeration already replaced the DevNode with its (non-)VBox counterpart.
-                    PInvoke.CM_Enable_DevNode(DeviceNode, 0).ThrowOnError(nameof(PInvoke.CM_Enable_DevNode));
+                    // For extra measure, we also try to reset the USB port, which may fail silently.
+                    var busId = GetBusId(DeviceNode);
+                    var hubInterfacePath = GetHubInterfacePath(DeviceNode);
+                    using var hubFile = new DeviceFile(hubInterfacePath);
+
+                    var data = new UsbCyclePortParams() { ConnectionIndex = busId.Port };
+                    var buf = Tools.StructToBytes(data);
+                    hubFile.IoControlAsync(IoControl.IOCTL_USB_HUB_CYCLE_PORT, buf, buf).Wait();
                 }
                 catch (ConfigurationManagerException) { }
+                catch (Win32Exception) { }
+
+                // This is the reverse of what the constructor accomplished.
+                PInvoke.CM_Setup_DevNode(DeviceNode, PInvoke.CM_SETUP_DEVNODE_READY);
             }
         }
     }

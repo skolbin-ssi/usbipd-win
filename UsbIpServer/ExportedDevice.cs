@@ -7,7 +7,6 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
-using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -21,28 +20,13 @@ using static UsbIpServer.Tools;
 
 namespace UsbIpServer
 {
-    sealed class ExportedDevice
+    sealed partial record ExportedDevice(string InstanceId, BusId BusId, Linux.UsbDeviceSpeed Speed,
+        ushort VendorId, ushort ProductId, ushort BcdDevice,
+        byte DeviceClass, byte DeviceSubClass, byte DeviceProtocol,
+        byte ConfigurationValue, byte NumConfigurations, List<(byte, byte, byte)> Interfaces);
+
+    sealed partial record ExportedDevice
     {
-        private ExportedDevice()
-        {
-        }
-
-        public string Path { get; private set; } = string.Empty;
-        public string HubPath { get; private init; } = string.Empty;
-        public BusId BusId { get; private init; }
-        public Linux.UsbDeviceSpeed Speed { get; private init; }
-        public ushort VendorId { get; private init; }
-        public ushort ProductId { get; private init; }
-        public ushort BcdDevice { get; private init; }
-        public byte DeviceClass { get; private init; }
-        public byte DeviceSubClass { get; private init; }
-        public byte DeviceProtocol { get; private init; }
-        public byte ConfigurationValue { get; private init; }
-        public byte NumConfigurations { get; private init; }
-        public List<(byte, byte, byte)> Interfaces { get; private set; } = new();
-
-        public string Description { get; private set; } = string.Empty;
-
         static void Serialize(Stream stream, string value, uint size)
         {
             var buf = new byte[size];
@@ -71,7 +55,7 @@ namespace UsbIpServer
 
         public void Serialize(Stream stream, bool includeInterfaces)
         {
-            Serialize(stream, Path, SYSFS_PATH_MAX);
+            Serialize(stream, InstanceId, SYSFS_PATH_MAX);
             Serialize(stream, BusId.ToString(), SYSFS_BUS_ID_SIZE);
             Serialize(stream, (uint)BusId.Bus);
             Serialize(stream, (uint)BusId.Port);
@@ -138,99 +122,89 @@ namespace UsbIpServer
             return result;
         }
 
-        static async Task<ExportedDevice?> GetExportedDevice(ConfigurationManager.UsbDevice device, CancellationToken cancellationToken)
+        public static async Task<ExportedDevice> GetExportedDevice(UsbDevice device, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            // now query the parent USB hub for device details
+            if (!device.BusId.HasValue)
+            {
+                throw new ArgumentException("device is not connected", nameof(device));
+            }
 
-            using var hubFile = new DeviceFile(device.HubInterface);
+            // Query the parent USB hub for device details.
+
+            var hubInterfacePath = ConfigurationManager.GetHubInterfacePath(device.StubInstanceId ?? device.InstanceId);
+            using var hubFile = new DeviceFile(hubInterfacePath);
             using var cancellationTokenRegistration = cancellationToken.Register(() => hubFile.Dispose());
-
-            var data = new UsbNodeConnectionInformationEx() { ConnectionIndex = device.BusId.Port };
-            var buf = StructToBytes(data);
-            await hubFile.IoControlAsync(IoControl.IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, buf, buf);
-            BytesToStruct(buf, out data);
-
-            var speed = MapWindowsSpeedToLinuxSpeed((USB_DEVICE_SPEED)data.Speed);
-
-            var data2 = new UsbNodeConnectionInformationExV2()
+            try
             {
-                ConnectionIndex = device.BusId.Port,
-                Length = (uint)Marshal.SizeOf<UsbNodeConnectionInformationExV2>(),
-                SupportedUsbProtocols = UsbProtocols.Usb110 | UsbProtocols.Usb200 | UsbProtocols.Usb300,
-            };
-            var buf2 = StructToBytes(data2);
-            await hubFile.IoControlAsync(IoControl.IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2, buf2, buf2);
-            BytesToStruct(buf2, out data2);
+                var data = new UsbNodeConnectionInformationEx() { ConnectionIndex = device.BusId.Value.Port };
+                var buf = StructToBytes(data);
+                await hubFile.IoControlAsync(IoControl.IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, buf, buf);
+                BytesToStruct(buf, out data);
 
-            if ((data2.SupportedUsbProtocols & UsbProtocols.Usb300) != 0)
-            {
-                if ((data2.Flags & UsbNodeConnectionInformationExV2Flags.DeviceIsOperatingAtSuperSpeedPlusOrHigher) != 0)
+                var speed = MapWindowsSpeedToLinuxSpeed((USB_DEVICE_SPEED)data.Speed);
+
+                var data2 = new UsbNodeConnectionInformationExV2()
                 {
-                    speed = Linux.UsbDeviceSpeed.USB_SPEED_SUPER_PLUS;
-                }
-                else if ((data2.Flags & UsbNodeConnectionInformationExV2Flags.DeviceIsOperatingAtSuperSpeedOrHigher) != 0)
+                    ConnectionIndex = device.BusId.Value.Port,
+                    Length = (uint)Marshal.SizeOf<UsbNodeConnectionInformationExV2>(),
+                    SupportedUsbProtocols = UsbProtocols.Usb110 | UsbProtocols.Usb200 | UsbProtocols.Usb300,
+                };
+                var buf2 = StructToBytes(data2);
+                await hubFile.IoControlAsync(IoControl.IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2, buf2, buf2);
+                BytesToStruct(buf2, out data2);
+
+                if ((data2.SupportedUsbProtocols & UsbProtocols.Usb300) != 0)
                 {
-                    speed = Linux.UsbDeviceSpeed.USB_SPEED_SUPER;
-                }
-            }
-
-            var exportedDevice = new ExportedDevice()
-            {
-                Path = device.DeviceId,
-                HubPath = device.HubInterface,
-                BusId = device.BusId,
-                Speed = speed,
-                VendorId = data.DeviceDescriptor.idVendor,
-                ProductId = data.DeviceDescriptor.idProduct,
-                BcdDevice = data.DeviceDescriptor.bcdDevice,
-                DeviceClass = data.DeviceDescriptor.bDeviceClass,
-                DeviceSubClass = data.DeviceDescriptor.bDeviceSubClass,
-                DeviceProtocol = data.DeviceDescriptor.bDeviceProtocol,
-                ConfigurationValue = data.CurrentConfigurationValue,
-                NumConfigurations = data.DeviceDescriptor.bNumConfigurations,
-                Interfaces = await GetInterfacesAsync(hubFile, device.BusId.Port),
-                Description = device.Description,
-            };
-
-            if (RegistryUtils.GetOriginalInstanceId(exportedDevice) is string originalInstanceId)
-            {
-                // If the device is currently attached, then VBoxMon will have overridden the path.
-                exportedDevice.Path = originalInstanceId;
-            }
-
-            if (RegistryUtils.GetDeviceDescription(exportedDevice) is string cachedDescription)
-            {
-                // If the device is currently attached, then we will have overridden the description.
-                exportedDevice.Description = cachedDescription;
-            }
-
-            return exportedDevice;
-        }
-
-        public static async Task<ExportedDevice[]> GetAll(CancellationToken cancellationToken)
-        {
-            var exportedDevices = new SortedDictionary<BusId, ExportedDevice>();
-            foreach (var device in ConfigurationManager.GetUsbDevices(true))
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                try
-                {
-                    if (await GetExportedDevice(device, cancellationToken) is ExportedDevice exportedDevice)
+                    if ((data2.Flags & UsbNodeConnectionInformationExV2Flags.DeviceIsOperatingAtSuperSpeedPlusOrHigher) != 0)
                     {
-                        exportedDevices.Add(exportedDevice.BusId, exportedDevice);
+                        // HACK: Linux vhci_hcd does not (yet) support USB_SPEED_SUPER_PLUS.
+                        // See: https://elixir.bootlin.com/linux/v5.16.9/source/drivers/usb/usbip/vhci_sysfs.c#L288
+                        // Looks like this only influences the reported rate; the USB protocol is supposed to be the same.
+                        // So, we simply lie about the speed...
+
+                        // speed = Linux.UsbDeviceSpeed.USB_SPEED_SUPER_PLUS;
+                        speed = Linux.UsbDeviceSpeed.USB_SPEED_SUPER;
+                    }
+                    else if ((data2.Flags & UsbNodeConnectionInformationExV2Flags.DeviceIsOperatingAtSuperSpeedOrHigher) != 0)
+                    {
+                        speed = Linux.UsbDeviceSpeed.USB_SPEED_SUPER;
                     }
                 }
-                catch (Win32Exception)
+
+                var interfaces = new List<(byte, byte, byte)>();
+                try
                 {
-                    // This can happen after standby/hibernation, or when racing against unplugging the device.
-                    // Simply do not report the device as present, which will force a surprise removal if the device was attached.
-                    // Common errors: ERROR_NO_SUCH_DEVICE, ERROR_GEN_FAILURE, and possibly many more
-                    continue;
+                    // This may or may not fail if the device is disabled.
+                    // Failure is not fatal, it just means that the export data will not contain
+                    // the interface list, which only makes the identification of the 
+                    // device by the user a little more difficult.
+                    interfaces = await GetInterfacesAsync(hubFile, device.BusId.Value.Port);
                 }
+                catch (Win32Exception) { }
+
+                var exportedDevice = new ExportedDevice(
+                    InstanceId: device.InstanceId,
+                    BusId: device.BusId.Value,
+                    Speed: speed,
+                    VendorId: data.DeviceDescriptor.idVendor,
+                    ProductId: data.DeviceDescriptor.idProduct,
+                    BcdDevice: data.DeviceDescriptor.bcdDevice,
+                    DeviceClass: data.DeviceDescriptor.bDeviceClass,
+                    DeviceSubClass: data.DeviceDescriptor.bDeviceSubClass,
+                    DeviceProtocol: data.DeviceDescriptor.bDeviceProtocol,
+                    ConfigurationValue: data.CurrentConfigurationValue,
+                    NumConfigurations: data.DeviceDescriptor.bNumConfigurations,
+                    Interfaces: interfaces);
+
+                return exportedDevice;
             }
-            return exportedDevices.Values.ToArray();
+            catch (ObjectDisposedException)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                throw;
+            }
         }
     }
 }

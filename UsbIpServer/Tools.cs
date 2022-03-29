@@ -3,13 +3,18 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 using System;
+using System.ComponentModel;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
-using UsbIpServer.Interop;
 using Windows.Win32.Devices.Usb;
+using Windows.Win32.Foundation;
+
+using static UsbIpServer.Interop.Linux;
+using static UsbIpServer.Interop.UsbIp;
+using static UsbIpServer.Interop.VBoxUsb;
 
 namespace UsbIpServer
 {
@@ -74,35 +79,70 @@ namespace UsbIpServer
             return result;
         }
 
-        public static Linux.UsbDeviceSpeed MapWindowsSpeedToLinuxSpeed(USB_DEVICE_SPEED w)
+        public static UsbDeviceSpeed MapWindowsSpeedToLinuxSpeed(USB_DEVICE_SPEED w)
         {
             // Windows and Linux each use a *different* enum for this
             return w switch
             {
-                USB_DEVICE_SPEED.UsbLowSpeed => Linux.UsbDeviceSpeed.USB_SPEED_LOW,
-                USB_DEVICE_SPEED.UsbFullSpeed => Linux.UsbDeviceSpeed.USB_SPEED_FULL,
-                USB_DEVICE_SPEED.UsbHighSpeed => Linux.UsbDeviceSpeed.USB_SPEED_HIGH,
-                USB_DEVICE_SPEED.UsbSuperSpeed => Linux.UsbDeviceSpeed.USB_SPEED_SUPER,
-                _ => Linux.UsbDeviceSpeed.USB_SPEED_UNKNOWN,
+                USB_DEVICE_SPEED.UsbLowSpeed => UsbDeviceSpeed.USB_SPEED_LOW,
+                USB_DEVICE_SPEED.UsbFullSpeed => UsbDeviceSpeed.USB_SPEED_FULL,
+                USB_DEVICE_SPEED.UsbHighSpeed => UsbDeviceSpeed.USB_SPEED_HIGH,
+                USB_DEVICE_SPEED.UsbSuperSpeed => UsbDeviceSpeed.USB_SPEED_SUPER,
+                _ => UsbDeviceSpeed.USB_SPEED_UNKNOWN,
             };
         }
 
         /// <summary>
         /// See <see href="https://www.kernel.org/doc/html/latest/driver-api/usb/error-codes.html"/>.
         /// </summary>
-        public static Linux.Errno ConvertError(VBoxUsb.UsbSupError usbSupError)
+        public static Errno ConvertError(UsbSupError usbSupError)
         {
             return usbSupError switch
             {
-                VBoxUsb.UsbSupError.USBSUP_XFER_OK => Linux.Errno.SUCCESS,
-                VBoxUsb.UsbSupError.USBSUP_XFER_STALL => Linux.Errno.EPIPE,
-                VBoxUsb.UsbSupError.USBSUP_XFER_DNR => Linux.Errno.ETIME,
-                VBoxUsb.UsbSupError.USBSUP_XFER_CRC => Linux.Errno.EILSEQ,
-                VBoxUsb.UsbSupError.USBSUP_XFER_NAC => Linux.Errno.EPROTO,
-                VBoxUsb.UsbSupError.USBSUP_XFER_UNDERRUN => Linux.Errno.EREMOTEIO,
-                VBoxUsb.UsbSupError.USBSUP_XFER_OVERRUN => Linux.Errno.EOVERFLOW,
-                _ => Linux.Errno.EPROTO,
+                UsbSupError.USBSUP_XFER_OK => Errno.SUCCESS,
+                UsbSupError.USBSUP_XFER_STALL => Errno.EPIPE,
+                UsbSupError.USBSUP_XFER_DNR => Errno.ETIME,
+                UsbSupError.USBSUP_XFER_CRC => Errno.EILSEQ,
+                UsbSupError.USBSUP_XFER_NAC => Errno.EPROTO,
+                UsbSupError.USBSUP_XFER_UNDERRUN => Errno.EREMOTEIO,
+                UsbSupError.USBSUP_XFER_OVERRUN => Errno.EOVERFLOW,
+                _ => Errno.EPROTO,
             };
+        }
+
+        public static void ThrowOnError(this BOOL success, string message)
+        {
+            if (!success)
+            {
+                throw new Win32Exception(message);
+            }
+        }
+
+        public static byte RawEndpoint(this UsbIpHeaderBasic basic)
+        {
+            return (byte)((basic.ep & 0x7f) | (basic.direction == UsbIpDir.USBIP_DIR_IN ? 0x80u : 0x00u));
+        }
+
+        public static UsbSupTransferType EndpointType(this UsbIpHeaderBasic basic, UsbIpHeaderCmdSubmit submit)
+        {
+            if (basic.ep == 0)
+            {
+                return UsbSupTransferType.USBSUP_TRANSFER_TYPE_MSG;
+            }
+            else if (submit.number_of_packets > 0)
+            {
+                // Specs at https://www.kernel.org/doc/html/latest/usb/usbip_protocol.html state that
+                // this shall be 0xffffffff for non-ISO, but Linux itself often sets it to 0.
+                return UsbSupTransferType.USBSUP_TRANSFER_TYPE_ISOC;
+            }
+            else if (submit.interval != 0)
+            {
+                return UsbSupTransferType.USBSUP_TRANSFER_TYPE_INTR;
+            }
+            else
+            {
+                return UsbSupTransferType.USBSUP_TRANSFER_TYPE_BULK;
+            }
         }
     }
 }
